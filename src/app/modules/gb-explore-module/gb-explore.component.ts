@@ -20,10 +20,24 @@ import {ConstraintService} from '../../services/constraint.service';
   templateUrl: './gb-explore.component.html',
   styleUrls: ['./gb-explore.component.css']
 })
-export class GbExploreComponent {
+export class GbExploreComponent implements OnInit {
 
   constructor(public queryService: QueryService,
               public constraintService: ConstraintService) {
+  }
+
+  ngOnInit() {
+    if (typeof Worker !== 'undefined') {
+      // Create a new
+      const worker = new Worker('./gb-explore.worker', { type: 'module' });
+      worker.onmessage = ({ data }) => {
+        console.log(`page got message: ${data}`);
+      };
+      worker.postMessage('hello');
+    } else {
+      // Web Workers are not supported in this environment.
+      // You should add a fallback so that your program still executes correctly.
+    }
   }
 
   get globalCount(): Observable<string> {
