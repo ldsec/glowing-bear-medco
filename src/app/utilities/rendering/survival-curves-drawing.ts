@@ -118,6 +118,7 @@ export class SurvivalCurvesDrawing {
       .style('z-index', 10)
       .attr('class', 'tooltip')
       .style('background-color', 'white')
+      .style('font-size', 'small')
       .html('Hello')
   }
 
