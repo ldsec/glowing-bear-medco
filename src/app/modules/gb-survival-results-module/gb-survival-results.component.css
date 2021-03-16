@@ -129,3 +129,7 @@ canvas{
 #survivalSvgContainer {
   position: relative;
 }
+
+.ci-overlay {
+  font-size: small;
+}
