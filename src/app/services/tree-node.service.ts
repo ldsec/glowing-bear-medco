@@ -8,22 +8,33 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-import {Injectable, Injector} from '@angular/core';
-import {Concept} from '../models/constraint-models/concept';
-import {ConceptConstraint} from '../models/constraint-models/concept-constraint';
-import {TreeNode} from '../models/tree-models/tree-node';
-import {ConstraintService} from './constraint.service';
-import {ErrorHelper} from '../utilities/error-helper';
-import {TreeNodeType} from '../models/tree-models/tree-node-type';
-import {AppConfig} from '../config/app.config';
-import {GenomicAnnotation} from '../models/constraint-models/genomic-annotation';
-import {ExploreSearchService} from './api/medco-node/explore-search.service';
-import {Observable} from 'rxjs';
-import {ApiValueMetadata, DataType} from '../models/api-response-models/medco-node/api-value-metadata';
-import {Modifier} from '../models/constraint-models/modifier';
+import { ApiValueMetadata, DataType } from '../models/api-response-models/medco-node/api-value-metadata';
+import { Modifier } from '../models/constraint-models/modifier';
+import { Injectable, Injector } from '@angular/core';
+import { Concept } from '../models/constraint-models/concept';
+import { ConceptConstraint } from '../models/constraint-models/concept-constraint';
+import { TreeNode } from '../models/tree-models/tree-node';
+import { ConstraintService } from './constraint.service';
+import { ErrorHelper } from '../utilities/error-helper';
+import { TreeNodeType } from '../models/tree-models/tree-node-type';
+import { AppConfig } from '../config/app.config';
+import { GenomicAnnotation } from '../models/constraint-models/genomic-annotation';
+import { ExploreSearchService } from './api/medco-node/explore-search.service';
+import { MedcoNetworkService } from './api/medco-network.service';
+import { forkJoin, Observable, Subscriber } from 'rxjs';
+import { timeout, map, catchError } from 'rxjs/operators';
+import { CryptoService } from './crypto.service';
+import { QueryService } from './query.service';
+import { ExploreQueryType } from '../models/query-models/explore-query-type';
+import { ApiNodeMetadata } from '../models/api-response-models/medco-network/api-node-metadata';
 
 @Injectable()
 export class TreeNodeService {
+
+  /**
+   * Query timeout: 1 minutes.
+   */
+  private static QUERY_TIMEOUT_MS = 1000 * 60 * 1;
 
   // the variable that holds the entire tree structure, used by the tree on the left side bar
   private _rootTreeNodes: TreeNode[] = [];
@@ -35,6 +46,10 @@ export class TreeNodeService {
   private config: AppConfig;
   private exploreSearchService: ExploreSearchService;
   private constraintService: ConstraintService;
+  private medcoNetworkService: MedcoNetworkService;
+  private cryptoService: CryptoService;
+  private queryService: QueryService;
+
 
   constructor(private injector: Injector) { }
 
@@ -46,6 +61,10 @@ export class TreeNodeService {
       this.config = this.injector.get(AppConfig);
       this.exploreSearchService = this.injector.get(ExploreSearchService);
       this.constraintService = this.injector.get(ConstraintService);
+      this.medcoNetworkService = this.injector.get(MedcoNetworkService);
+      this.cryptoService = this.injector.get(CryptoService);
+      this.queryService = this.injector.get(QueryService);
+
 
       this.constraintService.conceptLabels = [];
 
@@ -58,7 +77,7 @@ export class TreeNodeService {
           this.constraintService.concepts = [];
           this.constraintService.conceptConstraints = [];
 
-          this.processTreeNodes(treeNodes, this.constraintService);
+          this.processTreeNodes(treeNodes, this.constraintService, false);
           treeNodes.forEach((node) => this.rootTreeNodes.push(node));
           this._isLoading = false;
           resolve();
@@ -71,39 +90,184 @@ export class TreeNodeService {
     });
   }
 
-  /**
-   * Loads children of a node (if they were not already loaded).
-   * Meant to be used by the UI for the node-per-node browsing.
-   * @param {TreeNode} parentNode
-   * @param {ConstraintService} constraintService
+  /*
+   * used to generate a unique id that will be used to identify the subject count query during aggregation
+   * of subject counts accros different medco nodes
    */
-  public loadChildrenNodes(parentNode: TreeNode, constraintService: ConstraintService) {
+  private generateUniqueId(): string {
+    let d = new Date();
+    let id = `Medco_Subject_Count_Query_${d.getUTCFullYear()}${d.getUTCMonth()}${d.getUTCDate()}${d.getUTCHours()}` +
+      `${d.getUTCMinutes()}${d.getUTCSeconds()}${d.getUTCMilliseconds()}`;
+
+    return id;
+  }
+
+
+  private decryptSubjectCount(node: TreeNode): Observable<number> {
+
+    if (!node.subjectCountEncrypted) {
+      console.warn('undefined encrypted subject count for node', node.displayName)
+      return;
+    }
+
+    return this.cryptoService.decryptIntegersWithEphemeralKey([node.subjectCountEncrypted]).pipe(
+      map(counts => {
+        node.subjectCount = counts[0]
+
+        return counts[0]
+      })
+    )
+
+  }
+
+  private canLaunchTotalnumAggregation(): boolean {
+    const myQueryType = this.queryService.queryType
+    return myQueryType.weight >= ExploreQueryType.COUNT_GLOBAL.weight
+  }
+
+  private getChildrenSearchObservable(parentNode: TreeNode, medcoNodeUrl?: string, publicKey?: string, queryID?: string) {
+    return parentNode.isModifier() ?
+      this.exploreSearchService.exploreSearchModifierChildren(parentNode.path, parentNode.appliedPath,
+        parentNode.appliedConcept.path, medcoNodeUrl, publicKey, queryID) :
+      this.exploreSearchService.exploreSearchConceptChildren(parentNode.path, medcoNodeUrl, publicKey, queryID);
+  }
+
+  /* Request only the children names to have the children concepts names displayed ASAP.
+  * This wont request the subjects counts for each child.
+  */
+  private loadChildrenNodesNames(parentNode: TreeNode, constraintService: ConstraintService): Promise<void> {
     if (parentNode.leaf || parentNode.childrenAttached) {
       return
     }
 
     this._isLoading = true;
-    let resultObservable: Observable<TreeNode[]> = parentNode.isModifier() ?
-      this.exploreSearchService.exploreSearchModifierChildren(parentNode.path, parentNode.appliedPath, parentNode.appliedConcept.path) :
-      this.exploreSearchService.exploreSearchConceptChildren(parentNode.path)
+    this.exploreSearchService.exploreSearchConceptChildren(parentNode.path)
 
-    resultObservable.subscribe(
-      (treeNodes: TreeNode[]) => {
-        parentNode.attachChildTree(treeNodes);
-        parentNode.attachModifierData(treeNodes);
-        this.processTreeNodes(parentNode.children, constraintService);
-        this._isLoading = false;
-        if (treeNodes.length === 0) {
-          parentNode.leaf = true
+
+    let resultObservable: Observable<TreeNode[]> = this.getChildrenSearchObservable(parentNode)
+
+
+    const displayCountLoadingIcon: boolean = this.canLaunchTotalnumAggregation();
+
+    return new Promise(processingDoneResolve => {
+
+      resultObservable.subscribe(
+        (treeNodes: TreeNode[]) => {
+
+          const treeNodesLength = treeNodes ? treeNodes.length : 0;
+
+          if (treeNodesLength > 0) {
+            parentNode.attachChildTree(treeNodes);
+            parentNode.attachModifierData(treeNodes);
+            this.processTreeNodes(parentNode.children, constraintService, displayCountLoadingIcon);
+          }
+
+          processingDoneResolve()
+        },
+        (err) => {
+          ErrorHelper.handleError('Error during tree children loading', err);
         }
-      },
-      (err) => {
-        ErrorHelper.handleError('Error during tree children loading', err);
+      );
+
+    })
+
+
+
+  }
+  /**
+ * Loads children of a node (if they were not already loaded).
+ * Meant to be used by the UI for the node-per-node browsing.
+ * This method also requests for an homomorphic aggregation of children concepts' totalnum/subject count which will return treeNodes with
+ * the subject count field filled.
+ * @param {TreeNode} parentNode
+ * @param {ConstraintService} constraintService
+ */
+  public loadChildrenNodes(parentNode: TreeNode, constraintService: ConstraintService): Observable<TreeNode[]> {
+    if (parentNode.childrenLoadingStarted) {
+      return
+    }
+    parentNode.childrenLoadingStarted = true;
+    // first we request only the children names to have the children concepts names displayed ASAP.
+    const namesProcessingComplete: Promise<void> = this.loadChildrenNodesNames(parentNode, constraintService)
+
+    if (!this.canLaunchTotalnumAggregation()) {
+      console.log('no rights to launch aggregations')
+      this._isLoading = false;
+      return
+    }
+
+
+    let childrenProcessingStarted = false
+    const processChildrenWithSubjectCount = (children: TreeNode[]) => {
+
+      if (!children || children.length <= 0) {
         this._isLoading = false;
+        return
       }
+      /* Here we have to wait on the processing of the concept names to be done to finish in order to execute this code.
+      * Indeed we do a first request to the main node exclusively to fetch childrens' concept names. This optimizes the process.
+      * fetching the subject counts using homomorphic aggregation on the server side takes time.
+      * Hence the subscription to conceptNamesProcessedObservable.
+      */
+      namesProcessingComplete.then(_ => {
+        // Refresh treeNodes subject counts only once.
+        if (childrenProcessingStarted) {
+          return
+        }
+
+        childrenProcessingStarted = true
+        forkJoin(children.map(child => this.decryptSubjectCount(child))).subscribe(
+          counts => {
+            // all observable operations that deal with the decryption of subject counts have resolved
+            parentNode.refreshChildrenSubjectsCounts(children);
+            this.processTreeNodes(parentNode.children, constraintService, false);
+
+            this._isLoading = false;
+
+          },
+          err => { this._isLoading = false; ErrorHelper.handleError('Error during loading of subject counts', err) }
+        )
+
+      })
+
+    };
+
+    const handleAggregationError = (err: any, obs: Observable<any>) => {
+      ErrorHelper.handleError('Error during tree children loading', err);
+      this._isLoading = false;
+      return obs
+    };
+
+
+    const publicKey = this.cryptoService.ephemeralPublicKey;
+    const queryID = this.generateUniqueId();
+
+    // The following requests will execute homomorphic aggregation on all medco nodes of the totalnum column of each concept.
+    const aggregationsObservables = this.medcoNetworkService.nodes.map((node: ApiNodeMetadata) => {
+      return this.getChildrenSearchObservable(parentNode, node.url, publicKey, queryID).pipe(
+        map(processChildrenWithSubjectCount),
+        catchError(handleAggregationError)
+      )
+    });
+
+    const forkObservable = forkJoin(aggregationsObservables).pipe(timeout(TreeNodeService.QUERY_TIMEOUT_MS))
+
+    forkObservable.subscribe()
+
+    return forkObservable.pipe(
+      map((treeNodesArrays: TreeNode[][]) => {
+        if (treeNodesArrays && treeNodesArrays.length > 0) {
+          return treeNodesArrays[0]
+        }
+
+        return []
+      }) // pick the treeNodes returned by one of the medco nodes
     );
 
   }
+
+
+
 
   /**
    * Extracts concepts (and later possibly other dimensions) from the
@@ -111,15 +275,16 @@ export class TreeNodeService {
    *  And augment tree nodes with PrimeNG tree-ui specifications
    * @param treeNodes
    * @param constraintService
+   * @param displayCountLoadingIcon should a loading icon be displayed next to the tree node name?
    */
-  processTreeNodes(treeNodes: TreeNode[], constraintService: ConstraintService) {
+  processTreeNodes(treeNodes: TreeNode[], constraintService: ConstraintService, displayCountLoadingIcon: boolean) {
     if (!treeNodes) {
       return;
     }
     for (let node of treeNodes) {
-      this.processTreeNode(node, constraintService);
+      this.processTreeNode(node, constraintService, displayCountLoadingIcon);
       if (node.hasChildren()) {
-        this.processTreeNodes(node.children, constraintService);
+        this.processTreeNodes(node.children, constraintService, displayCountLoadingIcon);
       }
     }
   }
@@ -131,11 +296,19 @@ export class TreeNodeService {
    * @param {Object} node
    * @param {ConstraintService} constraintService
    */
-  processTreeNode(node: TreeNode, constraintService: ConstraintService) {
+  processTreeNode(node: TreeNode, constraintService: ConstraintService, displayCountLoadingIcon: boolean) {
 
     // generate label
     node.label = node.displayName;
+
+    const loadIcon = ` (loading count)`
+    if (displayCountLoadingIcon) {
+      node.label = node.label + loadIcon;
+    } else {
+      node.label = node.label.replace(loadIcon, '')
+    }
     if (node.subjectCount) {
+      node.label = node.label.replace(loadIcon, '')
       node.label = node.label + ` (${node.subjectCount})`;
     }
 

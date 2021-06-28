@@ -28,6 +28,8 @@ export class TreeNode implements PrimeNgTreeNode {
   depth: number;
   // number of subject (possibly undefined) associated with this node
   subjectCount: number;
+  // encrypted number of subject (possibly undefined) associated with this node. Usually computed by aggregation on the server side.
+  subjectCountEncrypted: string;
 
 
   // flag to signal if the children were requested to the backend
@@ -46,6 +48,9 @@ export class TreeNode implements PrimeNgTreeNode {
   styleClass: string;
   parent: TreeNode;
   partialSelected: boolean;
+
+  // An indicator saying whether or not the process of loading the children of this node started.
+  childrenLoadingStarted = false;
 
   clone(): TreeNode {
     let copy: TreeNode = new TreeNode();
@@ -66,6 +71,7 @@ export class TreeNode implements PrimeNgTreeNode {
     }
     copy.depth = this.depth;
     copy.subjectCount = this.subjectCount;
+    copy.subjectCountEncrypted = this.subjectCountEncrypted;
     copy.childrenAttached = this.childrenAttached;
     if (this.encryptionDescriptor) {
       copy.encryptionDescriptor = new MedcoEncryptionDescriptor()
@@ -83,6 +89,8 @@ export class TreeNode implements PrimeNgTreeNode {
     copy.expanded = this.expanded;
     copy.styleClass = this.styleClass;
     copy.partialSelected = this.partialSelected;
+    copy.childrenLoadingStarted = this.childrenLoadingStarted;
+
     return copy
   }
 
@@ -115,6 +123,22 @@ export class TreeNode implements PrimeNgTreeNode {
     return ((this.nodeType === TreeNodeType.MODIFIER)
       || (this.nodeType === TreeNodeType.MODIFIER_CONTAINER)
       || (this.nodeType === TreeNodeType.MODIFIER_FOLDER))
+  }
+
+  /*
+   * This method refresh this parent's children subject counts with the subject count of @param updatedChildren
+   * @param {TreeNode[]} updateChildren contains the children with updated subjects counts
+   */
+  refreshChildrenSubjectsCounts(updatedChildren: TreeNode[]) {
+    if (!this.hasChildren()) {
+      console.error('could not update children counts of this node, it does not have any children')
+      return;
+    }
+
+    updatedChildren.forEach(updatedChild => {
+      const matchingChild = this.children.find(child => child.path === updatedChild.path)
+      matchingChild.subjectCount = updatedChild.subjectCount;
+    })
   }
 
   /**
